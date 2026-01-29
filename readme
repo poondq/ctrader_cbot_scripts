@@ -1,0 +1,178 @@
+BandGapHedgerRsi1m_Incremental (cTrader / cAlgo)
+==============================================
+
+A cTrader cBot that places incremental hedge orders when BOTH stuck longs
+and stuck shorts exist, and the price gap between them becomes large.
+Hedges are gated by 1-minute RSI and capped as a percentage of the MAIN
+side exposure.
+
+--------------------------------------------------
+PURPOSE
+--------------------------------------------------
+This bot is designed for portfolios that already hold BOTH Buy and Sell
+positions on the same symbol.
+
+It incrementally hedges risk when:
+- Longs are underwater
+- Shorts are underwater
+- The distance between their weighted average entry prices is large
+
+The bot does NOT close trades or manage TP/SL.
+It only adds small hedge positions in controlled steps.
+
+--------------------------------------------------
+CORE CONCEPTS
+--------------------------------------------------
+
+MAIN positions:
+- Any position whose label does NOT start with "hedge_"
+
+HEDGE positions:
+- Any position whose label starts with "hedge_"
+
+The bot measures exposure ONLY from MAIN positions
+and limits hedge size relative to MAIN exposure.
+
+--------------------------------------------------
+HOW IT WORKS (LOGIC FLOW)
+--------------------------------------------------
+
+1) RSI SETUP (1-MINUTE)
+- RSI is calculated on 1-minute bars
+- RSI Period is configurable
+
+Hedge permissions:
+- Sell hedge allowed when RSI >= Sell Threshold
+- Buy hedge allowed when RSI <= Buy Threshold
+
+--------------------------------------------------
+
+2) POSITION FILTERING
+- Positions are filtered by symbol
+- Split into:
+  a) MAIN positions
+  b) HEDGE positions (label starts with "hedge_")
+
+If there are NO main positions → bot does nothing.
+
+--------------------------------------------------
+
+3) STUCK POSITION DETECTION
+Stuck Longs:
+- Buy positions where EntryPrice > current Bid
+
+Stuck Shorts:
+- Sell positions where EntryPrice < current Ask
+
+If either stuck longs OR stuck shorts is missing → bot does nothing.
+
+--------------------------------------------------
+
+4) PRICE BAND & GAP CALCULATION
+- Upper band = weighted average entry of stuck longs
+- Lower band = weighted average entry of stuck shorts
+
+Gap (in pips):
+(upperBand - lowerBand) / PipSize
+
+If gap < GapThresholdPips → bot does nothing.
+
+--------------------------------------------------
+
+5) HEDGE CAP CALCULATION
+MAIN exposure:
+- mainBuyUnits  = sum of MAIN Buy volumes
+- mainSellUnits = sum of MAIN Sell volumes
+
+Maximum hedge allowed:
+- Max Sell Hedge = mainBuyUnits  * HedgeCapPercent / 100
+- Max Buy Hedge  = mainSellUnits * HedgeCapPercent / 100
+
+This ensures hedges never exceed a percentage of the MAIN side.
+
+--------------------------------------------------
+
+6) INCREMENTAL HEDGE EXECUTION
+- Hedge size is fixed using HedgeStepLots
+- Converted to volume units and normalized
+- Minimum volume is enforced
+
+Execution priority:
+1) If Sell hedge allowed AND under Sell hedge cap → open Sell hedge
+2) Else if Buy hedge allowed AND under Buy hedge cap → open Buy hedge
+3) Else → no action
+
+Only ONE hedge is opened per evaluation cycle.
+
+--------------------------------------------------
+
+7) HEDGE LABELING
+Each hedge order is labeled as:
+
+hedge_###_<lots>_<tag>
+
+Examples:
+hedge_001_0.01_buyMain
+hedge_002_0.01_sellMain
+
+This allows clean separation between MAIN and HEDGE positions.
+
+--------------------------------------------------
+PARAMETERS
+--------------------------------------------------
+
+Gap Threshold (pips)
+- Minimum band gap before hedging activates
+
+Hedge Cap (% of MAIN side)
+- Maximum hedge exposure relative to MAIN exposure
+
+RSI Period (1m)
+- RSI calculation period on 1-minute bars
+
+RSI Sell Threshold
+- RSI value above which Sell hedges are allowed
+
+RSI Buy Threshold
+- RSI value below which Buy hedges are allowed
+
+Evaluation Interval (seconds)
+- How often the bot evaluates conditions
+
+Hedge Step (lots)
+- Fixed incremental hedge size per hedge
+
+Only This Symbol
+- Present but redundant (symbol filtering already applied)
+
+Debug Logs / Debug Log Every
+- Currently only prints execution results
+
+--------------------------------------------------
+IMPORTANT NOTES
+--------------------------------------------------
+- The bot never closes trades
+- No TP/SL logic is included
+- Multiple hedge increments can be opened over time
+- RSI neutrality zone prevents hedging
+- MAIN trades must NOT use the "hedge_" label
+- Designed for risk smoothing, not profit generation
+
+--------------------------------------------------
+USAGE
+--------------------------------------------------
+1) Open cTrader → Automate (cAlgo)
+2) Create a new cBot named:
+   BandGapHedgerRsi1m_Incremental
+3) Paste the source code
+4) Build
+5) Attach to a chart
+6) Configure parameters
+7) Start on DEMO before live use
+
+--------------------------------------------------
+DISCLAIMER
+--------------------------------------------------
+This software is provided for educational and experimental purposes only.
+Trading leveraged instruments involves significant risk.
+Always test thoroughly and understand exposure mechanics before live use.
