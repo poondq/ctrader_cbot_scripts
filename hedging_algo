@@ -1,0 +1,179 @@
+using cAlgo.API;
+using cAlgo.API.Indicators;
+using System;
+using System.Linq;
+
+namespace cAlgo.Robots
+{
+    [Robot(TimeZone = TimeZones.UTC, AccessRights = AccessRights.None)]
+    public class BandGapHedgerRsi1m_Incremental : Robot
+    {
+        [Parameter("Gap Threshold (pips)", DefaultValue = 100, MinValue = 1)]
+        public double GapThresholdPips { get; set; }
+
+        [Parameter("Hedge Cap (% of MAIN side)", DefaultValue = 50, MinValue = 1, MaxValue = 100)]
+        public double HedgeCapPercentOfMainSide { get; set; }
+
+        [Parameter("RSI Period (1m)", DefaultValue = 14, MinValue = 2)]
+        public int RsiPeriod { get; set; }
+
+        [Parameter("RSI Sell Threshold", DefaultValue = 60, MinValue = 1, MaxValue = 99)]
+        public double RsiSellThreshold { get; set; }
+
+        [Parameter("RSI Buy Threshold", DefaultValue = 40, MinValue = 1, MaxValue = 99)]
+        public double RsiBuyThreshold { get; set; }
+
+        [Parameter("Evaluation Interval (seconds)", DefaultValue = 3)]
+        public int EvaluationIntervalSeconds { get; set; }
+
+        [Parameter("Hedge Step (lots)", DefaultValue = 0.01, MinValue = 0.01)]
+        public double HedgeStepLots { get; set; }
+
+        [Parameter("Only This Symbol", DefaultValue = true)]
+        public bool OnlyThisSymbol { get; set; }
+
+        [Parameter("Debug Logs", DefaultValue = true)]
+        public bool DebugLogs { get; set; }
+
+        [Parameter("Debug Log Every (ms)", DefaultValue = 2000, MinValue = 250)]
+        public int DebugLogEveryMs { get; set; }
+
+        private Bars _m1;
+        private RelativeStrengthIndex _rsi;
+
+        private DateTime _nextDebugUtc;
+        private int _hedgeSeq = 0;
+
+        private const string HedgePrefix = "hedge_";
+
+        protected override void OnStart()
+        {
+            _m1 = MarketData.GetBars(TimeFrame.Minute);
+            _rsi = Indicators.RelativeStrengthIndex(_m1.ClosePrices, RsiPeriod);
+
+            _nextDebugUtc = Server.Time.ToUniversalTime();
+
+            Timer.Start(EvaluationIntervalSeconds);
+
+            Print("Started {0} on {1} | Gap={2}p | Cap={3}% | RSI({4}) Sell>={5} Buy<={6} | Step={7:0.00} | Interval={8}s",
+                GetType().Name,
+                Symbol.Name,
+                GapThresholdPips,
+                HedgeCapPercentOfMainSide,
+                RsiPeriod,
+                RsiSellThreshold,
+                RsiBuyThreshold,
+                HedgeStepLots,
+                EvaluationIntervalSeconds);
+        }
+
+        protected override void OnTimer()
+        {
+            EvaluateAndFireIncrementalHedges(Server.Time.ToUniversalTime());
+        }
+
+        private void EvaluateAndFireIncrementalHedges(DateTime nowUtc)
+        {
+            if (_m1.Count < Math.Max(50, RsiPeriod + 5))
+                return;
+
+            double rsiValue = _rsi.Result.LastValue;
+            double bid = Symbol.Bid;
+            double ask = Symbol.Ask;
+
+            var symbolPositions = Positions.Where(p => p.SymbolName == Symbol.Name);
+
+            var hedgePositions = symbolPositions
+                .Where(p => !string.IsNullOrEmpty(p.Label) && p.Label.StartsWith(HedgePrefix))
+                .ToList();
+
+            var mainPositions = symbolPositions
+                .Where(p => string.IsNullOrEmpty(p.Label) || !p.Label.StartsWith(HedgePrefix))
+                .ToList();
+
+            if (!mainPositions.Any())
+                return;
+
+            long mainBuyUnits = SumUnits(mainPositions, TradeType.Buy);
+            long mainSellUnits = SumUnits(mainPositions, TradeType.Sell);
+
+            long hedgeSellUnits = SumUnits(hedgePositions, TradeType.Sell);
+            long hedgeBuyUnits = SumUnits(hedgePositions, TradeType.Buy);
+
+            var stuckLongs = mainPositions.Where(p => p.TradeType == TradeType.Buy && p.EntryPrice > bid).ToList();
+            var stuckShorts = mainPositions.Where(p => p.TradeType == TradeType.Sell && p.EntryPrice < ask).ToList();
+
+            if (stuckLongs.Count == 0 || stuckShorts.Count == 0)
+                return;
+
+            double upperBand = WeightedAverageEntry(stuckLongs);
+            double lowerBand = WeightedAverageEntry(stuckShorts);
+
+            double gapPips = (upperBand - lowerBand) / Symbol.PipSize;
+            if (gapPips < GapThresholdPips)
+                return;
+
+            bool allowSellHedge = rsiValue >= RsiSellThreshold;
+            bool allowBuyHedge = rsiValue <= RsiBuyThreshold;
+
+            long maxSellHedgeUnits = (long)(mainBuyUnits * HedgeCapPercentOfMainSide / 100.0);
+            long maxBuyHedgeUnits = (long)(mainSellUnits * HedgeCapPercentOfMainSide / 100.0);
+
+            long stepUnitsRequested = ToLongUnits(Symbol.QuantityToVolumeInUnits(HedgeStepLots));
+            long stepUnits = ToLongUnits(Symbol.NormalizeVolumeInUnits(stepUnitsRequested, RoundingMode.Up));
+
+            if (stepUnits < ToLongUnits(Symbol.VolumeInUnitsMin))
+                stepUnits = ToLongUnits(Symbol.VolumeInUnitsMin);
+
+            if (allowSellHedge && hedgeSellUnits + stepUnits <= maxSellHedgeUnits)
+            {
+                OpenIncrementHedge(TradeType.Sell, stepUnits, "buyMain");
+                return;
+            }
+
+            if (allowBuyHedge && hedgeBuyUnits + stepUnits <= maxBuyHedgeUnits)
+            {
+                OpenIncrementHedge(TradeType.Buy, stepUnits, "sellMain");
+                return;
+            }
+        }
+
+        private static long SumUnits(System.Collections.Generic.IEnumerable<Position> positions, TradeType type)
+        {
+            long total = 0;
+            foreach (var p in positions)
+                if (p.TradeType == type)
+                    total += ToLongUnits(p.VolumeInUnits);
+            return total;
+        }
+
+        private static long ToLongUnits(double v) => (long)Math.Round(v, MidpointRounding.AwayFromZero);
+        private static long ToLongUnits(long v) => v;
+
+        private double WeightedAverageEntry(System.Collections.Generic.IEnumerable<Position> positions)
+        {
+            double vol = positions.Sum(p => (double)p.VolumeInUnits);
+            if (vol <= 0) return 0;
+            return positions.Sum(p => p.EntryPrice * (double)p.VolumeInUnits) / vol;
+        }
+
+        private void OpenIncrementHedge(TradeType type, long volumeInUnits, string tag)
+        {
+            long normalized = ToLongUnits(Symbol.NormalizeVolumeInUnits(volumeInUnits, RoundingMode.Down));
+            if (normalized < ToLongUnits(Symbol.VolumeInUnitsMin))
+                return;
+
+            double lots = Symbol.VolumeInUnitsToQuantity(normalized);
+
+            _hedgeSeq++;
+            string label = $"{HedgePrefix}{_hedgeSeq:D3}_{lots:0.00}_{tag}";
+
+            var result = ExecuteMarketOrder(type, Symbol.Name, normalized, label);
+
+            if (result.IsSuccessful)
+                Print("HEDGE {0} {1:0.00} lots | label={2}", type, lots, label);
+            else
+                Print("HEDGE FAILED {0}", result.Error);
+        }
+    }
+}
